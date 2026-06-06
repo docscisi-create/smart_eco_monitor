@@ -138,3 +138,18 @@ def clear_data():
     """Reset all stored data."""
     pd.DataFrame(columns=["date","time","temp","hum","aqi","co","smoke"]).to_excel(FILE, index=False)
     return {"status": "cleared"}
+    @app.get("/")
+def root():
+    return {
+        "service": "Smart Eco-Monitor API",
+        "status": "running",
+        "endpoints": {
+            "post_data": "/data",
+            "latest": "/data/latest",
+            "history": "/data/history",
+            "stats": "/data/stats",
+            "health": "/health",
+            "websocket": "/ws",
+            "docs": "/docs"
+        }
+    }
