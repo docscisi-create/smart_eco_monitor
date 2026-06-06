@@ -1,6 +1,5 @@
 """
 Smart Eco-Monitor — FastAPI Backend
-Run: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,8 +25,10 @@ app.add_middleware(
 readings: deque[dict] = deque(maxlen=MAX_READINGS)
 latest: dict = {}
 clients: list[WebSocket] = []
+wifi_config: dict = {}   # {"ssid": "...", "password": "..."}
 
 
+# ─── Models ──────────────────────────────────────────────────────────────────
 class SensorData(BaseModel):
     temp: float
     hum: float
@@ -36,125 +37,205 @@ class SensorData(BaseModel):
     smoke: float
     device_id: Optional[str] = "ESP32"
 
+class WiFiConfig(BaseModel):
+    ssid: str
+    password: str
 
-# ── Dashboard HTML ────────────────────────────────────────────────────────────
+
+# ─── Setup Page HTML ─────────────────────────────────────────────────────────
+SETUP_HTML = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>إعداد الشبكة — Smart Eco-Monitor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;
+     min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#1e2535;border-radius:16px;padding:2rem;width:100%;max-width:400px}
+h2{font-size:1.1rem;font-weight:600;margin-bottom:.4rem}
+p{font-size:.85rem;color:#64748b;margin-bottom:1.5rem;line-height:1.6}
+label{display:block;font-size:12px;color:#64748b;margin-bottom:6px}
+input{width:100%;background:#0f1117;border:1px solid #334155;border-radius:8px;
+      padding:10px 12px;color:#f8fafc;font-size:14px;margin-bottom:1rem;outline:none}
+input:focus{border-color:#3b82f6}
+button{width:100%;background:#3b82f6;border:none;border-radius:8px;color:#fff;
+       font-size:14px;padding:11px;cursor:pointer;font-weight:500}
+button:hover{background:#2563eb}
+.msg{margin-top:1rem;font-size:13px;text-align:center;min-height:20px}
+.ok{color:#22c55e} .err{color:#f87171}
+.back{display:block;text-align:center;margin-top:1rem;font-size:13px;color:#475569;text-decoration:none}
+.back:hover{color:#94a3b8}
+.status-row{display:flex;align-items:center;gap:8px;background:#0f1117;
+            border-radius:8px;padding:10px 12px;margin-bottom:1.5rem;font-size:13px;color:#64748b}
+.dot{width:8px;height:8px;border-radius:50%;background:#475569;flex-shrink:0}
+.dot.saved{background:#22c55e}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>📡 إعداد شبكة الواي فاي</h2>
+  <p>أدخل بيانات الشبكة. سيجلبها ESP32 تلقائياً عند التشغيل.</p>
+
+  <div class="status-row">
+    <span class="dot" id="cfg-dot"></span>
+    <span id="cfg-status">لا توجد بيانات محفوظة بعد</span>
+  </div>
+
+  <label>اسم الشبكة (SSID)</label>
+  <input type="text" id="ssid" placeholder="MyNetwork" autocomplete="off">
+
+  <label>كلمة المرور</label>
+  <input type="password" id="pass" placeholder="••••••••" autocomplete="off">
+
+  <button onclick="save()">حفظ وتفعيل</button>
+  <div class="msg" id="msg"></div>
+  <a class="back" href="/">← العودة للداشبورد</a>
+</div>
+<script>
+async function checkSaved() {
+  try {
+    const r = await fetch('/config/status');
+    const d = await r.json();
+    if (d.configured) {
+      document.getElementById('cfg-dot').className = 'dot saved';
+      document.getElementById('cfg-status').textContent = 'شبكة محفوظة: ' + d.ssid;
+    }
+  } catch(_){}
+}
+
+async function save() {
+  const ssid = document.getElementById('ssid').value.trim();
+  const pass = document.getElementById('pass').value;
+  const msg  = document.getElementById('msg');
+  if (!ssid) { msg.className='msg err'; msg.textContent='أدخل اسم الشبكة'; return; }
+  msg.className='msg'; msg.textContent='جاري الحفظ…';
+  try {
+    const r = await fetch('/config', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ssid, password: pass})
+    });
+    const d = await r.json();
+    if (d.status === 'ok') {
+      msg.className='msg ok';
+      msg.textContent='✅ تم الحفظ! سيتصل ESP32 تلقائياً عند التشغيل.';
+      document.getElementById('cfg-dot').className = 'dot saved';
+      document.getElementById('cfg-status').textContent = 'شبكة محفوظة: ' + ssid;
+      document.getElementById('ssid').value = '';
+      document.getElementById('pass').value = '';
+    }
+  } catch(e) {
+    msg.className='msg err'; msg.textContent='خطأ في الحفظ، حاول مرة أخرى';
+  }
+}
+checkSaved();
+</script>
+</body>
+</html>"""
+
+
+# ─── Dashboard HTML ───────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Smart Eco-Monitor</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
-  header { padding: 1.2rem 2rem; border-bottom: 1px solid #1e2535; display: flex; align-items: center; justify-content: space-between; }
-  header h1 { font-size: 1.1rem; font-weight: 600; color: #fff; }
-  .badge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #94a3b8;
-           background: #1e2535; border-radius: 20px; padding: 4px 12px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; }
-  .dot.live { background: #22c55e; animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-
-  /* ── waiting state ── */
-  #waiting { display: flex; flex-direction: column; align-items: center; justify-content: center;
-             min-height: 70vh; gap: 16px; text-align: center; padding: 2rem; }
-  .waiting-icon { font-size: 3rem; opacity: .4; }
-  #waiting h2 { font-size: 1.2rem; color: #94a3b8; font-weight: 500; }
-  #waiting p  { font-size: .9rem; color: #475569; max-width: 340px; line-height: 1.6; }
-  .steps { list-style: none; margin-top: 1rem; display: flex; flex-direction: column; gap: 8px; }
-  .steps li { background: #1e2535; border-radius: 8px; padding: 8px 16px;
-              font-size: 13px; color: #64748b; display: flex; align-items: center; gap: 10px; }
-  .steps li span { background: #334155; border-radius: 50%; width: 22px; height: 22px;
-                   display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
-
-  /* ── dashboard ── */
-  #dashboard { display: none; padding: 1.5rem 2rem; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 12px; margin-bottom: 1.5rem; }
-  .card { background: #1e2535; border-radius: 12px; padding: 1rem 1.2rem; }
-  .card-label { font-size: 11px; color: #64748b; margin-bottom: 4px; }
-  .card-val { font-size: 26px; font-weight: 600; color: #f8fafc; line-height: 1; }
-  .card-unit { font-size: 11px; color: #475569; margin-top: 3px; }
-  .bar { height: 3px; background: #0f1117; border-radius: 2px; margin-top: 8px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 2px; transition: width .6s ease; }
-  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 1.5rem; }
-  .chart-box { background: #1e2535; border-radius: 12px; padding: 14px; }
-  .chart-title { font-size: 12px; color: #64748b; margin-bottom: 10px; }
-  .alert { background: #3b0f0f; border: 1px solid #7f1d1d; border-radius: 8px;
-           padding: 10px 16px; font-size: 13px; color: #fca5a5;
-           display: none; align-items: center; gap: 8px; margin-bottom: 1rem; }
-  .alert.show { display: flex; }
-  .log-wrap { background: #1e2535; border-radius: 12px; padding: 12px 14px;
-              font-family: monospace; font-size: 12px; color: #475569; max-height: 90px; overflow-y: auto; }
-  .log-line.ok  { color: #22c55e; }
-  .log-line.err { color: #f87171; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+header{padding:1.2rem 2rem;border-bottom:1px solid #1e2535;display:flex;align-items:center;justify-content:space-between;gap:12px}
+header h1{font-size:1.1rem;font-weight:600;color:#fff}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.badge{display:flex;align-items:center;gap:6px;font-size:12px;color:#94a3b8;
+       background:#1e2535;border-radius:20px;padding:4px 12px}
+.dot{width:8px;height:8px;border-radius:50%;background:#475569}
+.dot.live{background:#22c55e;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.setup-btn{font-size:12px;color:#3b82f6;background:none;border:1px solid #1e3a5f;
+           border-radius:20px;padding:4px 12px;cursor:pointer;text-decoration:none}
+.setup-btn:hover{background:#1e2535}
+#waiting{display:flex;flex-direction:column;align-items:center;justify-content:center;
+         min-height:70vh;gap:16px;text-align:center;padding:2rem}
+.waiting-icon{font-size:3rem;opacity:.4}
+#waiting h2{font-size:1.2rem;color:#94a3b8;font-weight:500}
+#waiting p{font-size:.9rem;color:#475569;max-width:340px;line-height:1.6}
+.steps{list-style:none;margin-top:1rem;display:flex;flex-direction:column;gap:8px}
+.steps li{background:#1e2535;border-radius:8px;padding:8px 16px;font-size:13px;
+          color:#64748b;display:flex;align-items:center;gap:10px}
+.steps li span{background:#334155;border-radius:50%;width:22px;height:22px;
+               display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0}
+.goto-setup{margin-top:.5rem;display:inline-block;background:#3b82f6;color:#fff;
+            border-radius:8px;padding:10px 24px;font-size:14px;text-decoration:none}
+.goto-setup:hover{background:#2563eb}
+#dashboard{display:none;padding:1.5rem 2rem}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:1.5rem}
+.card{background:#1e2535;border-radius:12px;padding:1rem 1.2rem}
+.card-label{font-size:11px;color:#64748b;margin-bottom:4px}
+.card-val{font-size:26px;font-weight:600;color:#f8fafc;line-height:1}
+.card-unit{font-size:11px;color:#475569;margin-top:3px}
+.bar{height:3px;background:#0f1117;border-radius:2px;margin-top:8px;overflow:hidden}
+.bar-fill{height:100%;border-radius:2px;transition:width .6s ease}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:1.5rem}
+.chart-box{background:#1e2535;border-radius:12px;padding:14px}
+.chart-title{font-size:12px;color:#64748b;margin-bottom:10px}
+.alert{background:#3b0f0f;border:1px solid #7f1d1d;border-radius:8px;
+       padding:10px 16px;font-size:13px;color:#fca5a5;
+       display:none;align-items:center;gap:8px;margin-bottom:1rem}
+.alert.show{display:flex}
+.log-wrap{background:#1e2535;border-radius:12px;padding:12px 14px;
+          font-family:monospace;font-size:12px;color:#475569;max-height:90px;overflow-y:auto}
+.log-line.ok{color:#22c55e}.log-line.err{color:#f87171}
 </style>
 </head>
 <body>
 <header>
   <h1>🌿 Smart Eco-Monitor</h1>
-  <div class="badge"><span class="dot" id="dot"></span><span id="status-txt">جاري الاتصال…</span></div>
+  <div class="hdr-right">
+    <div class="badge"><span class="dot" id="dot"></span><span id="status-txt">جاري الاتصال…</span></div>
+    <a class="setup-btn" href="/setup">⚙ إعداد الشبكة</a>
+  </div>
 </header>
 
-<!-- Waiting state -->
 <div id="waiting">
   <div class="waiting-icon">📡</div>
   <h2>في انتظار بيانات السينسر</h2>
-  <p>السيرفر يعمل بشكل صحيح، لكن لم يصل أي قراءة من ESP32 بعد.</p>
+  <p>السيرفر يعمل بشكل صحيح. أدخل بيانات الواي فاي أولاً حتى يتصل ESP32.</p>
   <ul class="steps">
-    <li><span>1</span>افتح الكود في Arduino IDE</li>
-    <li><span>2</span>أدخل اسم الواي فاي وكلمة السر عبر Serial Monitor</li>
-    <li><span>3</span>تأكد أن ESP32 متصل بالإنترنت</li>
-    <li><span>4</span>ستظهر البيانات هنا تلقائياً</li>
+    <li><span>1</span>اضغط "إعداد الشبكة" وأدخل بيانات الواي فاي</li>
+    <li><span>2</span>شغّل ESP32 — سيجلب البيانات تلقائياً</li>
+    <li><span>3</span>ستظهر القراءات هنا فور الاتصال</li>
   </ul>
+  <a class="goto-setup" href="/setup">إعداد الشبكة الآن ←</a>
 </div>
 
-<!-- Dashboard (hidden until first reading) -->
 <div id="dashboard">
   <div class="alert" id="alert-box">⚠️ <span id="alert-msg"></span></div>
   <div class="cards">
-    <div class="card">
-      <div class="card-label">🌡 الحرارة</div>
-      <div class="card-val" id="v-temp">--</div>
-      <div class="card-unit">°C</div>
-      <div class="bar"><div class="bar-fill" id="b-temp" style="background:#ef4444;width:0%"></div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">💧 الرطوبة</div>
-      <div class="card-val" id="v-hum">--</div>
-      <div class="card-unit">%</div>
-      <div class="bar"><div class="bar-fill" id="b-hum" style="background:#3b82f6;width:0%"></div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">💨 جودة الهواء</div>
-      <div class="card-val" id="v-aqi">--</div>
-      <div class="card-unit">AQI</div>
-      <div class="bar"><div class="bar-fill" id="b-aqi" style="background:#22c55e;width:0%"></div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">☁️ أول أكسيد الكربون</div>
-      <div class="card-val" id="v-co">--</div>
-      <div class="card-unit">ppm</div>
-      <div class="bar"><div class="bar-fill" id="b-co" style="background:#f59e0b;width:0%"></div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">🔥 الدخان</div>
-      <div class="card-val" id="v-smoke">--</div>
-      <div class="card-unit">ppm</div>
-      <div class="bar"><div class="bar-fill" id="b-smoke" style="background:#a855f7;width:0%"></div></div>
-    </div>
+    <div class="card"><div class="card-label">🌡 الحرارة</div>
+      <div class="card-val" id="v-temp">--</div><div class="card-unit">°C</div>
+      <div class="bar"><div class="bar-fill" id="b-temp" style="background:#ef4444;width:0%"></div></div></div>
+    <div class="card"><div class="card-label">💧 الرطوبة</div>
+      <div class="card-val" id="v-hum">--</div><div class="card-unit">%</div>
+      <div class="bar"><div class="bar-fill" id="b-hum" style="background:#3b82f6;width:0%"></div></div></div>
+    <div class="card"><div class="card-label">💨 جودة الهواء</div>
+      <div class="card-val" id="v-aqi">--</div><div class="card-unit">AQI</div>
+      <div class="bar"><div class="bar-fill" id="b-aqi" style="background:#22c55e;width:0%"></div></div></div>
+    <div class="card"><div class="card-label">☁️ أول أكسيد الكربون</div>
+      <div class="card-val" id="v-co">--</div><div class="card-unit">ppm</div>
+      <div class="bar"><div class="bar-fill" id="b-co" style="background:#f59e0b;width:0%"></div></div></div>
+    <div class="card"><div class="card-label">🔥 الدخان</div>
+      <div class="card-val" id="v-smoke">--</div><div class="card-unit">ppm</div>
+      <div class="bar"><div class="bar-fill" id="b-smoke" style="background:#a855f7;width:0%"></div></div></div>
   </div>
-
   <div class="charts">
-    <div class="chart-box">
-      <div class="chart-title">الحرارة والرطوبة</div>
-      <div style="position:relative;height:140px"><canvas id="chart-th"></canvas></div>
-    </div>
-    <div class="chart-box">
-      <div class="chart-title">جودة الهواء</div>
-      <div style="position:relative;height:140px"><canvas id="chart-aq"></canvas></div>
-    </div>
+    <div class="chart-box"><div class="chart-title">الحرارة والرطوبة</div>
+      <div style="position:relative;height:140px"><canvas id="chart-th"></canvas></div></div>
+    <div class="chart-box"><div class="chart-title">جودة الهواء</div>
+      <div style="position:relative;height:140px"><canvas id="chart-aq"></canvas></div></div>
   </div>
-
   <div class="log-wrap" id="log"></div>
 </div>
 
@@ -163,120 +244,92 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 const BASE = location.origin;
 let chartTH, chartAQ, hasData = false;
 
-function setStatus(live) {
-  document.getElementById('dot').className = 'dot' + (live ? ' live' : '');
-  document.getElementById('status-txt').textContent = live ? 'متصل — بيانات مباشرة' : 'غير متصل';
+function setStatus(live){
+  document.getElementById('dot').className='dot'+(live?' live':'');
+  document.getElementById('status-txt').textContent=live?'متصل — بيانات مباشرة':'غير متصل';
 }
-
-function showDashboard() {
-  if (hasData) return;
-  hasData = true;
-  document.getElementById('waiting').style.display   = 'none';
-  document.getElementById('dashboard').style.display = 'block';
+function showDashboard(){
+  if(hasData)return; hasData=true;
+  document.getElementById('waiting').style.display='none';
+  document.getElementById('dashboard').style.display='block';
   initCharts();
 }
-
-function log(msg, cls='') {
-  const el = document.getElementById('log');
-  const d  = document.createElement('div');
-  d.className = 'log-line ' + cls;
-  d.textContent = new Date().toLocaleTimeString('ar') + '  ' + msg;
+function log(msg,cls=''){
+  const el=document.getElementById('log');
+  const d=document.createElement('div');
+  d.className='log-line '+cls;
+  d.textContent=new Date().toLocaleTimeString('ar')+'  '+msg;
   el.prepend(d);
-  while (el.children.length > 20) el.removeChild(el.lastChild);
+  while(el.children.length>20)el.removeChild(el.lastChild);
 }
-
-function setCard(id, val, max) {
-  document.getElementById('v-'+id).textContent = typeof val === 'number' ? val.toFixed(1) : '--';
-  document.getElementById('b-'+id).style.width = Math.min(100,(val/max)*100).toFixed(1)+'%';
+function setCard(id,val,max){
+  document.getElementById('v-'+id).textContent=typeof val==='number'?val.toFixed(1):'--';
+  document.getElementById('b-'+id).style.width=Math.min(100,(val/max)*100).toFixed(1)+'%';
 }
-
-function checkAlerts(d) {
-  const msgs = [];
-  if (d.aqi   > 150) msgs.push('جودة الهواء سيئة (AQI ' + d.aqi.toFixed(0) + ')');
-  if (d.co    > 35)  msgs.push('CO مرتفع (' + d.co.toFixed(0) + ' ppm)');
-  if (d.smoke > 100) msgs.push('دخان مرتفع (' + d.smoke.toFixed(0) + ' ppm)');
-  if (d.temp  > 40)  msgs.push('حرارة مرتفعة (' + d.temp.toFixed(1) + '°C)');
-  const box = document.getElementById('alert-box');
-  if (msgs.length) { box.classList.add('show'); document.getElementById('alert-msg').textContent = msgs.join(' · '); }
-  else { box.classList.remove('show'); }
+function checkAlerts(d){
+  const msgs=[];
+  if(d.aqi>150)msgs.push('جودة الهواء سيئة (AQI '+d.aqi.toFixed(0)+')');
+  if(d.co>35)msgs.push('CO مرتفع ('+d.co.toFixed(0)+' ppm)');
+  if(d.smoke>100)msgs.push('دخان مرتفع ('+d.smoke.toFixed(0)+' ppm)');
+  if(d.temp>40)msgs.push('حرارة مرتفعة ('+d.temp.toFixed(1)+'°C)');
+  const box=document.getElementById('alert-box');
+  if(msgs.length){box.classList.add('show');document.getElementById('alert-msg').textContent=msgs.join(' · ');}
+  else box.classList.remove('show');
 }
-
-function applyReading(d) {
+function applyReading(d){
   showDashboard();
-  setCard('temp',  d.temp,  60);
-  setCard('hum',   d.hum,   100);
-  setCard('aqi',   d.aqi,   500);
-  setCard('co',    d.co,    1000);
-  setCard('smoke', d.smoke, 1000);
+  setCard('temp',d.temp,60); setCard('hum',d.hum,100);
+  setCard('aqi',d.aqi,500); setCard('co',d.co,1000); setCard('smoke',d.smoke,1000);
   checkAlerts(d);
-  log('T:'+d.temp.toFixed(1)+' H:'+d.hum.toFixed(1)+' AQI:'+d.aqi.toFixed(0), 'ok');
+  log('T:'+d.temp.toFixed(1)+' H:'+d.hum.toFixed(1)+' AQI:'+d.aqi.toFixed(0),'ok');
 }
-
-function initCharts() {
-  const cfg = (datasets) => ({
-    type:'line', data:{ labels:[], datasets },
-    options:{ responsive:true, maintainAspectRatio:false, animation:false,
-      plugins:{ legend:{display:false} },
-      scales:{ x:{ ticks:{font:{size:10},maxTicksLimit:6,color:'#475569'}, grid:{color:'rgba(255,255,255,.05)'}},
-               y:{ ticks:{font:{size:10},color:'#475569'}, grid:{color:'rgba(255,255,255,.05)'}} }}
-  });
-  chartTH = new Chart(document.getElementById('chart-th'), cfg([
-    {label:'Temp', data:[], borderColor:'#ef4444', borderWidth:1.5, pointRadius:0, tension:.3, fill:false},
-    {label:'Hum',  data:[], borderColor:'#3b82f6', borderWidth:1.5, pointRadius:0, tension:.3, fill:false, borderDash:[4,3]},
+function initCharts(){
+  const cfg=(ds)=>({type:'line',data:{labels:[],datasets:ds},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{font:{size:10},maxTicksLimit:6,color:'#475569'},grid:{color:'rgba(255,255,255,.05)'}},
+              y:{ticks:{font:{size:10},color:'#475569'},grid:{color:'rgba(255,255,255,.05)'}}}}});
+  chartTH=new Chart(document.getElementById('chart-th'),cfg([
+    {label:'Temp',data:[],borderColor:'#ef4444',borderWidth:1.5,pointRadius:0,tension:.3,fill:false},
+    {label:'Hum',data:[],borderColor:'#3b82f6',borderWidth:1.5,pointRadius:0,tension:.3,fill:false,borderDash:[4,3]},
   ]));
-  chartAQ = new Chart(document.getElementById('chart-aq'), cfg([
-    {label:'AQI',   data:[], borderColor:'#22c55e', borderWidth:1.5, pointRadius:0, tension:.3, fill:false},
-    {label:'CO',    data:[], borderColor:'#f59e0b', borderWidth:1.5, pointRadius:0, tension:.3, fill:false, borderDash:[4,3]},
-    {label:'Smoke', data:[], borderColor:'#a855f7', borderWidth:1.5, pointRadius:0, tension:.3, fill:false, borderDash:[2,4]},
+  chartAQ=new Chart(document.getElementById('chart-aq'),cfg([
+    {label:'AQI',data:[],borderColor:'#22c55e',borderWidth:1.5,pointRadius:0,tension:.3,fill:false},
+    {label:'CO',data:[],borderColor:'#f59e0b',borderWidth:1.5,pointRadius:0,tension:.3,fill:false,borderDash:[4,3]},
+    {label:'Smoke',data:[],borderColor:'#a855f7',borderWidth:1.5,pointRadius:0,tension:.3,fill:false,borderDash:[2,4]},
   ]));
 }
-
-function pushChart(rows) {
-  if (!chartTH) return;
-  const labels = rows.map(r => r.time ? r.time.slice(0,5) : '');
-  chartTH.data.labels = labels;
-  chartTH.data.datasets[0].data = rows.map(r=>r.temp);
-  chartTH.data.datasets[1].data = rows.map(r=>r.hum);
+function pushChart(rows){
+  if(!chartTH)return;
+  const labels=rows.map(r=>r.time?r.time.slice(0,5):'');
+  chartTH.data.labels=labels;
+  chartTH.data.datasets[0].data=rows.map(r=>r.temp);
+  chartTH.data.datasets[1].data=rows.map(r=>r.hum);
   chartTH.update('none');
-  chartAQ.data.labels = labels;
-  chartAQ.data.datasets[0].data = rows.map(r=>r.aqi);
-  chartAQ.data.datasets[1].data = rows.map(r=>r.co);
-  chartAQ.data.datasets[2].data = rows.map(r=>r.smoke);
+  chartAQ.data.labels=labels;
+  chartAQ.data.datasets[0].data=rows.map(r=>r.aqi);
+  chartAQ.data.datasets[1].data=rows.map(r=>r.co);
+  chartAQ.data.datasets[2].data=rows.map(r=>r.smoke);
   chartAQ.update('none');
 }
-
-async function fetchLatest() {
-  try {
-    const [lr, hr] = await Promise.all([
-      fetch(BASE+'/data/latest'), fetch(BASE+'/data/history?limit=30')
-    ]);
-    const latest  = await lr.json();
-    const history = await hr.json();
-    if (!latest.error) {
-      setStatus(true);
-      applyReading(latest);
-      if (Array.isArray(history) && history.length) pushChart(history.slice(-30));
-    } else {
-      setStatus(false);
-      log('لا توجد بيانات بعد — ESP32 لم يتصل', 'err');
-    }
-  } catch(e) {
-    setStatus(false);
-    log('خطأ في الاتصال بالسيرفر', 'err');
-  }
+async function fetchLatest(){
+  try{
+    const[lr,hr]=await Promise.all([fetch(BASE+'/data/latest'),fetch(BASE+'/data/history?limit=30')]);
+    const latest=await lr.json(); const history=await hr.json();
+    if(!latest.error){
+      setStatus(true); applyReading(latest);
+      if(Array.isArray(history)&&history.length)pushChart(history.slice(-30));
+    } else { setStatus(false); log('لا توجد بيانات بعد','err'); }
+  }catch(e){setStatus(false);log('خطأ في الاتصال','err');}
 }
-
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(proto + '://' + location.host + '/ws');
-  ws.onopen  = () => setStatus(true);
-  ws.onmessage = e => { try { applyReading(JSON.parse(e.data)); } catch(_){} };
-  ws.onclose = () => { setStatus(false); setTimeout(connectWS, 4000); };
+function connectWS(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const ws=new WebSocket(proto+'://'+location.host+'/ws');
+  ws.onopen=()=>setStatus(true);
+  ws.onmessage=e=>{try{applyReading(JSON.parse(e.data));}catch(_){}};
+  ws.onclose=()=>{setStatus(false);setTimeout(connectWS,4000);};
 }
-
-fetchLatest();
-connectWS();
-setInterval(fetchLatest, 10000);
+fetchLatest(); connectWS(); setInterval(fetchLatest,10000);
 </script>
 </body>
 </html>"""
@@ -286,20 +339,36 @@ setInterval(fetchLatest, 10000);
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    """Serve the dashboard HTML."""
     return HTMLResponse(content=DASHBOARD_HTML)
 
+@app.get("/setup", response_class=HTMLResponse)
+def setup_page():
+    return HTMLResponse(content=SETUP_HTML)
 
-@app.get("/api")
-def api_info():
-    """JSON info about the API."""
+@app.post("/config")
+def save_config(cfg: WiFiConfig):
+    """Browser POSTs WiFi credentials here."""
+    global wifi_config
+    wifi_config = {"ssid": cfg.ssid, "password": cfg.password}
+    return {"status": "ok", "ssid": cfg.ssid}
+
+@app.get("/config")
+def get_config():
+    """ESP32 GETs WiFi credentials from here."""
+    if not wifi_config:
+        return {"configured": False}
     return {
-        "service": "Smart Eco-Monitor API",
-        "status": "running",
-        "total_readings": len(readings),
-        "sensor_connected": len(readings) > 0,
+        "configured": True,
+        "ssid":       wifi_config["ssid"],
+        "password":   wifi_config["password"],
     }
 
+@app.get("/config/status")
+def config_status():
+    """Dashboard checks if credentials are saved."""
+    if not wifi_config:
+        return {"configured": False}
+    return {"configured": True, "ssid": wifi_config["ssid"]}
 
 @app.post("/data")
 async def receive_data(data: SensorData):
@@ -308,86 +377,63 @@ async def receive_data(data: SensorData):
     row = {
         "date":  now.strftime("%Y-%m-%d"),
         "time":  now.strftime("%H:%M:%S"),
-        "temp":  round(data.temp,  2),
-        "hum":   round(data.hum,   2),
-        "aqi":   round(data.aqi,   2),
-        "co":    round(data.co,    2),
-        "smoke": round(data.smoke, 2),
+        "temp":  round(data.temp, 2),
+        "hum":   round(data.hum,  2),
+        "aqi":   round(data.aqi,  2),
+        "co":    round(data.co,   2),
+        "smoke": round(data.smoke,2),
     }
     readings.append(row)
     latest = {**row, "device": data.device_id, "ts": now.isoformat()}
-
-    msg  = json.dumps(latest)
+    msg = json.dumps(latest)
     dead = []
     for ws in list(clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.append(ws)
+        try: await ws.send_text(msg)
+        except Exception: dead.append(ws)
     for ws in dead:
-        if ws in clients:
-            clients.remove(ws)
-
+        if ws in clients: clients.remove(ws)
     return {"status": "ok", "received": row}
-
 
 @app.get("/data/latest")
 def get_latest():
     return latest if latest else {"error": "no data yet"}
 
-
 @app.get("/data/history")
 def get_history(limit: int = 200):
     return list(readings)[-limit:]
-
 
 @app.get("/data/stats")
 def get_stats():
     if not readings:
         return {"sensor_connected": False}
-    cols = ["temp", "hum", "aqi", "co", "smoke"]
+    cols = ["temp","hum","aqi","co","smoke"]
     stats: dict = {"sensor_connected": True}
     for col in cols:
         values = [r[col] for r in readings if col in r]
-        if not values:
-            continue
-        stats[col] = {
-            "min":  round(min(values), 2),
-            "max":  round(max(values), 2),
-            "avg":  round(sum(values) / len(values), 2),
-            "last": round(values[-1], 2),
-        }
+        if not values: continue
+        stats[col] = {"min":round(min(values),2),"max":round(max(values),2),
+                      "avg":round(sum(values)/len(values),2),"last":round(values[-1],2)}
     stats["total_readings"] = len(readings)
     return stats
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients.append(ws)
     try:
-        if latest:
-            await ws.send_text(json.dumps(latest))
-        while True:
-            await ws.receive_text()
+        if latest: await ws.send_text(json.dumps(latest))
+        while True: await ws.receive_text()
     except WebSocketDisconnect:
-        if ws in clients:
-            clients.remove(ws)
-
+        if ws in clients: clients.remove(ws)
 
 @app.get("/health")
 def health():
-    return {
-        "status": "running",
-        "sensor_connected": len(readings) > 0,
-        "connected_clients": len(clients),
-        "total_readings": len(readings),
-    }
-
+    return {"status":"running","sensor_connected":len(readings)>0,
+            "wifi_configured":bool(wifi_config),"connected_clients":len(clients),
+            "total_readings":len(readings)}
 
 @app.delete("/data")
 def clear_data():
     global latest
-    readings.clear()
-    latest = {}
+    readings.clear(); latest = {}
     return {"status": "cleared"}
