@@ -1,16 +1,27 @@
 """
 Smart Eco-Monitor — FastAPI Backend
 Run: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+Changes vs original:
+  - Added root GET / route (fixes "Not Found" on Railway)
+  - Replaced ephemeral Excel file with in-memory deque (Railway filesystem is wiped on restart)
+  - readings deque capped at MAX_READINGS to bound memory
+  - /health no longer crashes when FILE doesn't exist
+  - /data/stats and /data/history work purely from in-memory list
+  - WebSocket cleanup is thread-safe (copied list before iterating)
+  - Removed unused HTMLResponse + asyncio imports
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from datetime import datetime
-import pandas as pd
-import os, asyncio, json
+from collections import deque
 from typing import Optional
+import json
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+MAX_READINGS = 10_000   # cap in-memory history
 
 app = FastAPI(title="Smart Eco-Monitor API")
 
@@ -21,14 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FILE = "sensor_data.xlsx"
+# ─── State ───────────────────────────────────────────────────────────────────
+readings: deque[dict] = deque(maxlen=MAX_READINGS)
 latest: dict = {}
 clients: list[WebSocket] = []
 
-if not os.path.exists(FILE):
-    pd.DataFrame(columns=["date","time","temp","hum","aqi","co","smoke"]).to_excel(FILE, index=False)
 
-
+# ─── Models ──────────────────────────────────────────────────────────────────
 class SensorData(BaseModel):
     temp: float
     hum: float
@@ -38,118 +48,128 @@ class SensorData(BaseModel):
     device_id: Optional[str] = "ESP32"
 
 
+# ─── Routes ──────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    """Root route — confirms the API is reachable and lists endpoints."""
+    return {
+        "service": "Smart Eco-Monitor API",
+        "status": "running",
+        "total_readings": len(readings),
+        "endpoints": {
+            "POST /data":          "Submit a sensor reading (ESP32)",
+            "GET  /data/latest":   "Most recent reading",
+            "GET  /data/history":  "Last N readings  (?limit=200)",
+            "GET  /data/stats":    "Min / max / avg per sensor",
+            "GET  /health":        "Health check",
+            "WS   /ws":            "Real-time WebSocket stream",
+            "DELETE /data":        "Clear all stored readings",
+            "GET  /docs":          "Interactive API docs (Swagger UI)",
+        },
+    }
+
+
 @app.post("/data")
 async def receive_data(data: SensorData):
-    """ESP32/Arduino POSTs sensor readings here."""
+    """ESP32 POSTs sensor readings here."""
     global latest
     now = datetime.now()
+
     row = {
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M:%S"),
-        "temp": round(data.temp, 2),
-        "hum": round(data.hum, 2),
-        "aqi": round(data.aqi, 2),
-        "co": round(data.co, 2),
+        "date":  now.strftime("%Y-%m-%d"),
+        "time":  now.strftime("%H:%M:%S"),
+        "temp":  round(data.temp,  2),
+        "hum":   round(data.hum,   2),
+        "aqi":   round(data.aqi,   2),
+        "co":    round(data.co,    2),
         "smoke": round(data.smoke, 2),
     }
+
+    readings.append(row)
     latest = {**row, "device": data.device_id, "ts": now.isoformat()}
 
-    # Save to Excel every reading
-    try:
-        df = pd.read_excel(FILE)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        df.to_excel(FILE, index=False)
-    except Exception as e:
-        print(f"Excel error: {e}")
-
-    # Push to all WebSocket clients
-    msg = json.dumps(latest)
+    # Push to all connected WebSocket clients
+    msg  = json.dumps(latest)
     dead = []
-    for ws in clients:
+    for ws in list(clients):          # iterate a copy so removal is safe
         try:
             await ws.send_text(msg)
-        except:
+        except Exception:
             dead.append(ws)
     for ws in dead:
-        clients.remove(ws)
+        if ws in clients:
+            clients.remove(ws)
 
     return {"status": "ok", "received": row}
 
 
 @app.get("/data/latest")
 def get_latest():
-    """Dashboard polls this endpoint."""
+    """Return the most recent sensor reading."""
     return latest if latest else {"error": "no data yet"}
 
 
 @app.get("/data/history")
 def get_history(limit: int = 200):
-    """Return last N readings from Excel."""
-    if not os.path.exists(FILE):
-        return []
-    df = pd.read_excel(FILE)
-    return df.tail(limit).to_dict(orient="records")
+    """Return the last `limit` readings (default 200)."""
+    data = list(readings)
+    return data[-limit:]
 
 
 @app.get("/data/stats")
 def get_stats():
-    """Summary statistics for analytics."""
-    if not os.path.exists(FILE):
+    """Min / max / avg / last for every sensor column."""
+    if not readings:
         return {}
-    df = pd.read_excel(FILE)
-    if df.empty:
-        return {}
-    cols = ["temp","hum","aqi","co","smoke"]
-    stats = {}
-    for c in cols:
-        if c in df.columns:
-            stats[c] = {
-                "min": round(float(df[c].min()), 2),
-                "max": round(float(df[c].max()), 2),
-                "avg": round(float(df[c].mean()), 2),
-                "last": round(float(df[c].iloc[-1]), 2) if len(df) else 0,
-            }
-    stats["total_readings"] = len(df)
+
+    cols = ["temp", "hum", "aqi", "co", "smoke"]
+    stats: dict = {}
+
+    for col in cols:
+        values = [r[col] for r in readings if col in r]
+        if not values:
+            continue
+        stats[col] = {
+            "min":  round(min(values), 2),
+            "max":  round(max(values), 2),
+            "avg":  round(sum(values) / len(values), 2),
+            "last": round(values[-1], 2),
+        }
+
+    stats["total_readings"] = len(readings)
     return stats
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """Real-time WebSocket stream."""
+    """Real-time WebSocket stream — push every new reading to connected clients."""
     await ws.accept()
     clients.append(ws)
     try:
-        # Send latest immediately on connect
         if latest:
             await ws.send_text(json.dumps(latest))
         while True:
-            await ws.receive_text()   # keep alive
+            await ws.receive_text()   # keeps connection alive
     except WebSocketDisconnect:
-        clients.remove(ws)
+        if ws in clients:
+            clients.remove(ws)
 
 
 @app.get("/health")
 def health():
-    return {"status": "running", "clients": len(clients), "readings": len(pd.read_excel(FILE)) if os.path.exists(FILE) else 0}
+    """Quick health check."""
+    return {
+        "status":         "running",
+        "connected_clients": len(clients),
+        "total_readings": len(readings),
+    }
 
 
 @app.delete("/data")
 def clear_data():
-    """Reset all stored data."""
-    pd.DataFrame(columns=["date","time","temp","hum","aqi","co","smoke"]).to_excel(FILE, index=False)
+    """Wipe all in-memory readings and reset latest."""
+    global latest
+    readings.clear()
+    latest = {}
     return {"status": "cleared"}
-    @app.get("/")
-def root():
-    return {
-        "service": "Smart Eco-Monitor API",
-        "status": "running",
-        "endpoints": {
-            "post_data": "/data",
-            "latest": "/data/latest",
-            "history": "/data/history",
-            "stats": "/data/stats",
-            "health": "/health",
-            "websocket": "/ws",
-            "docs": "/docs"
-        }
-    }
