@@ -20,7 +20,7 @@ const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // ─── Server ─────────────────────────────────────────────────────────────────
-const char* SERVER_URL = "https://eco-monitor-xxx.railway.app/data";   // ← change to your PC IP
+const char* SERVER_URL = "https://smartecomonitor-production.up.railway.app";   // ← change to your PC IP
 
 // ─── Pins ────────────────────────────────────────────────────────────────────
 #define DHT_PIN    4
