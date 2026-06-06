@@ -16,8 +16,8 @@
 #include <DHT.h>
 
 // ─── WiFi ───────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID     = "Arkan";
+const char* WIFI_PASSWORD = "88888888";
 
 // ─── Server ─────────────────────────────────────────────────────────────────
 const char* SERVER_URL = "https://smartecomonitor-production.up.railway.app/data";  
