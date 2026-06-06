@@ -16,7 +16,7 @@
 #include <DHT.h>
 
 // ─── WiFi ───────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "Arkan";
+const char* WIFI_SSID     = "Arkan_5G";
 const char* WIFI_PASSWORD = "88888888";
 
 // ─── Server ─────────────────────────────────────────────────────────────────
